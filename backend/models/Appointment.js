@@ -48,6 +48,11 @@ const appointmentSchema = new mongoose.Schema(
       enum: ['pending', 'confirmed', 'completed', 'cancelled'],
       default: 'pending',
     },
+    // Code court unique pour validation WhatsApp (ex: "A472")
+    shortCode: {
+      type: String,
+      sparse: true, // index partiel — null autorisé
+    },
     notes: {
       type: String,
       trim: true,

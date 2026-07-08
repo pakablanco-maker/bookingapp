@@ -7,6 +7,8 @@ import {
   formatDate,
 } from '../utils/helpers.js';
 import { asyncHandler } from '../utils/errorHandler.js';
+import { sendBookingConfirmation, sendBookingCancellation, sendOwnerPendingAlert } from '../utils/whatsappService.js';
+import { generateShortCode } from '../utils/shortCodeGenerator.js';
 
 // @route   GET /api/appointments
 // @desc    Get all appointments for authenticated business owner
@@ -213,6 +215,9 @@ const createAppointment = asyncHandler(async (req, res) => {
     });
   }
 
+  // Générer un code court unique pour cet RDV (ex: A472)
+  const shortCode = await generateShortCode();
+
   // Create appointment
   const appointment = await Appointment.create({
     businessId,
@@ -224,6 +229,27 @@ const createAppointment = asyncHandler(async (req, res) => {
     startTime,
     endTime,
     status: 'pending',
+    shortCode,
+  });
+
+  // Récupérer les infos du service pour le message propriétaire
+  const formattedDate = formatDate(new Date(appointmentDate));
+
+  // Envoyer l'alerte WhatsApp au propriétaire (async, non bloquant)
+  setImmediate(async () => {
+    try {
+      await sendOwnerPendingAlert(businessId.toString(), {
+        appointmentId: appointment._id,
+        shortCode,
+        clientName,
+        clientPhone,
+        serviceName: service.name,
+        bookingDate: formattedDate,
+        bookingTime: startTime,
+      });
+    } catch (err) {
+      console.error('[WhatsApp] Erreur alerte propriétaire (non bloquante):', err.message);
+    }
   });
 
   res.status(201).json({
@@ -240,34 +266,60 @@ const updateAppointmentStatus = asyncHandler(async (req, res) => {
   const { status } = req.body;
 
   if (!status || !['pending', 'confirmed', 'completed', 'cancelled'].includes(status)) {
-    return res.status(400).json({
-      success: false,
-      message: 'Please provide a valid status',
-    });
+    return res.status(400).json({ success: false, message: 'Please provide a valid status' });
   }
 
+  // 1. Récupération initiale
   let appointment = await Appointment.findById(req.params.id);
 
   if (!appointment) {
-    return res.status(404).json({
-      success: false,
-      message: 'Appointment not found',
-    });
+    return res.status(404).json({ success: false, message: 'Appointment not found' });
   }
 
-  // Verify ownership
-  if (appointment.businessId.toString() !== req.userId) {
-    return res.status(403).json({
-      success: false,
-      message: 'Not authorized to update this appointment',
-    });
-  }
-
+  // 2. Mise à jour
+  // On utilise populate pour récupérer les noms du service et du business d'un coup
   appointment = await Appointment.findByIdAndUpdate(
     req.params.id,
     { status },
     { new: true, runValidators: true }
-  ).populate('serviceId', 'name price duration');
+  ).populate('serviceId', 'name price').populate('businessId', 'name');
+
+  // --- DEBUG LOGS (À supprimer après test) ---
+  console.log("Nom Client:", appointment.clientName);
+  console.log("Tel Client:", appointment.clientPhone);
+  // -------------------------------------------
+
+  // --- LOGIQUE D'ENVOI WHATSAPP ---
+  if (status === 'confirmed') {
+    // On vérifie que le téléphone existe avant d'appeler le service
+    if (appointment.clientPhone) {
+        sendBookingConfirmation({ 
+          businessId: appointment.businessId?._id || appointment.businessId,
+          customerPhone: appointment.clientPhone,
+          customerName: appointment.clientName,
+          serviceName: appointment.serviceId?.name || "Service",
+          bookingDate: appointment.formattedDate,
+          bookingTime: appointment.startTime,
+          businessName: appointment.businessId?.name || "Notre Établissement"
+         });
+    } else {
+        console.error("Impossible d'envoyer le WhatsApp : clientPhone est manquant.");
+    }
+  } 
+  
+  else if (status === 'cancelled') {
+    if (appointment.clientPhone) {
+        sendBookingCancellation({ 
+          businessId: appointment.businessId?._id || appointment.businessId,
+          customerPhone: appointment.clientPhone,
+          customerName: appointment.clientName,
+          serviceName: appointment.serviceId?.name || "Service",
+          bookingDate: appointment.formattedDate,
+          bookingTime: appointment.startTime,
+          businessName: appointment.businessId?.name || "Notre Établissement"
+        });
+    }
+  }
 
   res.status(200).json({
     success: true,

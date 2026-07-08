@@ -3,11 +3,16 @@ import { Container, Row, Col, Spinner } from 'react-bootstrap';
 import { useDispatch, useSelector } from 'react-redux';
 import { getTodayAppointments, getStats } from '../features/appointements/appointmentSlice';
 import { FaCalendarAlt, FaCheckCircle, FaClock, FaTimesCircle } from 'react-icons/fa';
+import WhatsAppConnect from '../components/WhatsAppConnect';
+import api from '../services/api';
 
 const DashboardPage = () => {
   const dispatch = useDispatch();
   const { user } = useSelector((state) => state.auth);
   const { stats, todayAppointments, loading } = useSelector((state) => state.appointments);
+  const [restartLoading, setRestartLoading] = useState(false);
+  const [restartMessage, setRestartMessage] = useState(null);
+  const [whatsappStatus, setWhatsappStatus] = useState(null);
 
   useEffect(() => {
     dispatch(getStats());
@@ -190,6 +195,59 @@ const DashboardPage = () => {
               <FaTimesCircle className="me-2" style={{ color: '#e74c3c' }} />
               <span className="text-muted">Cancelled: {stats?.cancelled}</span>
             </div>
+          </div>
+        </Col>
+      </Row>
+
+      {/* WhatsApp Connect Card */}
+      <Row className="mb-4">
+        <Col lg={8}>
+          <div className="stat-card">
+            <h5 className="mb-3">💬 Connect to WhatsApp</h5>
+            <p className="text-muted mb-3">Connect your WhatsApp account to manage bookings</p>
+            <WhatsAppConnect businessId={user?._id} onStatusChange={setWhatsappStatus} />
+
+            {/* Force restart button (business only) - hidden when WhatsApp is connected */}
+            {(user?.role === 'business' || user?.role === 'admin') && whatsappStatus !== 'connected' && (
+              <div className="mt-3">
+                <button
+                  className="btn btn-outline-danger"
+                  disabled={restartLoading}
+                  onClick={async () => {
+                    const ok = window.confirm('Confirmer : forcer la réinitialisation de la session WhatsApp ?');
+                    if (!ok) return;
+                    setRestartLoading(true);
+                    setRestartMessage(null);
+                    try {
+                      const body = user?.role === 'admin' ? { businessId: user?._id } : {};
+                      const res = await api.post('/whatsapp/admin/restart-session', body);
+                      if (res?.data?.success) {
+                        setRestartMessage({ type: 'success', text: res.data.message || 'Session réinitialisée.' });
+                      } else {
+                        setRestartMessage({ type: 'error', text: res?.data?.message || 'Échec serveur' });
+                      }
+                    } catch (err) {
+                      console.error(err);
+                      const serverMsg = err?.response?.data?.message || err?.message || 'Erreur lors de l\'appel';
+                      setRestartMessage({ type: 'error', text: serverMsg });
+                    } finally {
+                      setRestartLoading(false);
+                    }
+                  }}
+                >
+                  {restartLoading && (
+                    <span className="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>
+                  )}
+                  🔁 Réinitialiser WhatsApp
+                </button>
+
+                {restartMessage && (
+                  <div className={`mt-2 text-${restartMessage.type === 'success' ? 'success' : 'danger'}`}>
+                    {restartMessage.text}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </Col>
       </Row>
