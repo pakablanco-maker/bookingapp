@@ -1,5 +1,95 @@
 name: CI
 
+permissions:
+  contents: read
+  packages: write
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  backend-checks:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - name: Create .env from repository secrets
+        run: |
+          cat > .env <<EOF
+          MONGO_URI=${{ secrets.MONGO_URI }}
+          SENTRY_DSN=${{ secrets.SENTRY_DSN }}
+          JWT_SECRET=${{ secrets.JWT_SECRET }}
+          FRONTEND_URL=${{ secrets.FRONTEND_URL }}
+          NODE_ENV=production
+          EOF
+        shell: bash
+
+      - name: Validate environment
+        run: npm run env-check -- --strict
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run syntax checks
+        run: npm run check
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/bookingapp-backend:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/bookingapp-backend:latest
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@v0.0.22
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/bookingapp-backend:latest
+
+      - name: Run backend image and wait for health
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/bookingapp-backend:latest
+          docker run -d --name backend_integration_test --env-file .env -p 5000:5000 $IMAGE || (docker logs backend_integration_test && false)
+          echo "Waiting for /api/health..."
+          for i in {1..30}; do
+            if curl -fsS http://localhost:5000/api/health > /dev/null; then
+              echo "Health check OK"; break
+            fi
+            sleep 2
+          done
+
+      - name: Run integration smoke tests
+        run: |
+          set -e
+          echo "Running smoke tests against http://localhost:5000"
+          curl -fsS http://localhost:5000/api/health | jq .
+          # Example: further integration checks can be added here (create appointment, status flow, etc.)
+
+      - name: Tear down backend container
+        if: always()
+        run: |
+          docker logs backend_integration_test || true
+          docker rm -f backend_integration_test || true
+name: CI
+
 on:
   push:
     branches:

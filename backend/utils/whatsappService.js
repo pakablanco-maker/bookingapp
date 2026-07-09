@@ -1,4 +1,6 @@
 import { sendMessageWithRestore, sendOwnerAlertWithRestore } from '../config/whtasappManager.js';
+import * as Sentry from '@sentry/node';
+import { captureException } from '../config/sentry.js';
 
 // Envoyer une notification de confirmation de réservation
 export const sendBookingConfirmation = async (bookingData) => {
@@ -22,7 +24,17 @@ Votre réservation a été confirmée ! 🎉
 Merci de votre confiance !
 L'équipe *${bookingData.businessName}*`;
 
-        await sendMessageWithRestore(bookingData.businessId, bookingData.customerPhone, message);
+        // Instrument send with Sentry transaction
+        const tx = Sentry.startTransaction({ op: 'notify.client', name: 'Send Booking Confirmation' });
+        try {
+            Sentry.getCurrentHub().configureScope((scope) => scope.setSpan(tx));
+            await sendMessageWithRestore(bookingData.businessId, bookingData.customerPhone, message);
+        } catch (err) {
+            captureException(err, { businessId: bookingData.businessId });
+            throw err;
+        } finally {
+            tx.finish();
+        }
     } catch (error) {
         console.error('[WhatsApp] Erreur lors de l\'envoi de la confirmation :', error);
     }
@@ -50,7 +62,16 @@ Nous vous informons que votre réservation a été annulée.
 Nous espérons vous revoir bientôt.
 L'équipe *${bookingData.businessName}*`;
 
-        await sendMessageWithRestore(bookingData.businessId, bookingData.customerPhone, message);
+        const tx = Sentry.startTransaction({ op: 'notify.client', name: 'Send Booking Cancellation' });
+        try {
+            Sentry.getCurrentHub().configureScope((scope) => scope.setSpan(tx));
+            await sendMessageWithRestore(bookingData.businessId, bookingData.customerPhone, message);
+        } catch (err) {
+            captureException(err, { businessId: bookingData.businessId });
+            throw err;
+        } finally {
+            tx.finish();
+        }
     } catch (error) {
         console.error('[WhatsApp] Erreur lors de l\'envoi de l\'annulation :', error);
     }
@@ -63,7 +84,16 @@ L'équipe *${bookingData.businessName}*`;
  */
 export const sendOwnerPendingAlert = async (businessId, appointmentData) => {
     try {
-        await sendOwnerAlertWithRestore(businessId, appointmentData);
+        const tx = Sentry.startTransaction({ op: 'notify.owner', name: 'Send Owner Pending Alert' });
+        try {
+            Sentry.getCurrentHub().configureScope((scope) => scope.setSpan(tx));
+            await sendOwnerAlertWithRestore(businessId, appointmentData);
+        } catch (err) {
+            captureException(err, { businessId, appointmentId: appointmentData?.appointmentId });
+            throw err;
+        } finally {
+            tx.finish();
+        }
     } catch (error) {
         console.error('[WhatsApp] Erreur lors de l\'envoi de l\'alerte propriétaire :', error);
     }

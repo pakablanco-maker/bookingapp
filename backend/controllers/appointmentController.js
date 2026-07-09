@@ -9,6 +9,8 @@ import {
 import { asyncHandler } from '../utils/errorHandler.js';
 import { sendBookingConfirmation, sendBookingCancellation, sendOwnerPendingAlert } from '../utils/whatsappService.js';
 import { generateShortCode } from '../utils/shortCodeGenerator.js';
+import * as Sentry from '@sentry/node';
+import { captureException } from '../config/sentry.js';
 
 // @route   GET /api/appointments
 // @desc    Get all appointments for authenticated business owner
@@ -218,39 +220,54 @@ const createAppointment = asyncHandler(async (req, res) => {
   // Générer un code court unique pour cet RDV (ex: A472)
   const shortCode = await generateShortCode();
 
-  // Create appointment
-  const appointment = await Appointment.create({
-    businessId,
-    serviceId,
-    clientName,
-    clientPhone,
-    clientEmail,
-    appointmentDate: new Date(appointmentDate),
-    startTime,
-    endTime,
-    status: 'pending',
-    shortCode,
-  });
+  // Create appointment with Sentry transaction
+  const transaction = Sentry.startTransaction({ op: 'booking.create', name: 'Create Appointment' });
+  try {
+    Sentry.getCurrentHub().configureScope((scope) => scope.setSpan(transaction));
+    const dbSpan = transaction.startChild({ op: 'db', description: 'Appointment.create' });
+    const appointment = await Appointment.create({
+      businessId,
+      serviceId,
+      clientName,
+      clientPhone,
+      clientEmail,
+      appointmentDate: new Date(appointmentDate),
+      startTime,
+      endTime,
+      status: 'pending',
+      shortCode,
+    });
+    dbSpan.finish();
 
-  // Récupérer les infos du service pour le message propriétaire
-  const formattedDate = formatDate(new Date(appointmentDate));
+    // Récupérer les infos du service pour le message propriétaire
+    const formattedDate = formatDate(new Date(appointmentDate));
 
-  // Envoyer l'alerte WhatsApp au propriétaire (async, non bloquant)
-  setImmediate(async () => {
-    try {
-      await sendOwnerPendingAlert(businessId.toString(), {
-        appointmentId: appointment._id,
-        shortCode,
-        clientName,
-        clientPhone,
-        serviceName: service.name,
-        bookingDate: formattedDate,
-        bookingTime: startTime,
-      });
-    } catch (err) {
-      console.error('[WhatsApp] Erreur alerte propriétaire (non bloquante):', err.message);
-    }
-  });
+    // Schedule owner alert in its own transaction (non-blocking)
+    setImmediate(async () => {
+      const alertTx = Sentry.startTransaction({ op: 'booking.owner_alert', name: 'Owner Alert Send' });
+      try {
+        Sentry.getCurrentHub().configureScope((scope) => scope.setSpan(alertTx));
+        await sendOwnerPendingAlert(businessId.toString(), {
+          appointmentId: appointment._id,
+          shortCode,
+          clientName,
+          clientPhone,
+          serviceName: service.name,
+          bookingDate: formattedDate,
+          bookingTime: startTime,
+        });
+      } catch (err) {
+        captureException(err, { businessId, appointmentId: appointment._id });
+      } finally {
+        alertTx.finish();
+      }
+    });
+
+    transaction.finish();
+  } catch (err) {
+    transaction.finish();
+    throw err;
+  }
 
   res.status(201).json({
     success: true,
@@ -276,13 +293,17 @@ const updateAppointmentStatus = asyncHandler(async (req, res) => {
     return res.status(404).json({ success: false, message: 'Appointment not found' });
   }
 
-  // 2. Mise à jour
-  // On utilise populate pour récupérer les noms du service et du business d'un coup
-  appointment = await Appointment.findByIdAndUpdate(
-    req.params.id,
-    { status },
-    { new: true, runValidators: true }
-  ).populate('serviceId', 'name price').populate('businessId', 'name');
+  // 2. Mise à jour (avec transaction Sentry)
+  const tx = Sentry.startTransaction({ op: 'booking.update_status', name: `Update Appointment ${req.params.id} -> ${status}` });
+  try {
+    Sentry.getCurrentHub().configureScope((scope) => scope.setSpan(tx));
+    const dbSpan = tx.startChild({ op: 'db', description: 'Appointment.findByIdAndUpdate' });
+    appointment = await Appointment.findByIdAndUpdate(
+      req.params.id,
+      { status },
+      { new: true, runValidators: true }
+    ).populate('serviceId', 'name price').populate('businessId', 'name');
+    dbSpan.finish();
 
   // --- DEBUG LOGS (À supprimer après test) ---
   console.log("Nom Client:", appointment.clientName);
@@ -290,18 +311,21 @@ const updateAppointmentStatus = asyncHandler(async (req, res) => {
   // -------------------------------------------
 
   // --- LOGIQUE D'ENVOI WHATSAPP ---
-  if (status === 'confirmed') {
+    if (status === 'confirmed') {
     // On vérifie que le téléphone existe avant d'appeler le service
     if (appointment.clientPhone) {
-        sendBookingConfirmation({ 
+        // send notification as part of the Sentry transaction
+        const notifySpan = tx.startChild({ op: 'notify', description: 'sendBookingConfirmation' });
+        await sendBookingConfirmation({
           businessId: appointment.businessId?._id || appointment.businessId,
           customerPhone: appointment.clientPhone,
           customerName: appointment.clientName,
-          serviceName: appointment.serviceId?.name || "Service",
+          serviceName: appointment.serviceId?.name || 'Service',
           bookingDate: appointment.formattedDate,
           bookingTime: appointment.startTime,
-          businessName: appointment.businessId?.name || "Notre Établissement"
-         });
+          businessName: appointment.businessId?.name || 'Notre Établissement',
+        });
+        notifySpan.finish();
     } else {
         console.error("Impossible d'envoyer le WhatsApp : clientPhone est manquant.");
     }
@@ -309,16 +333,23 @@ const updateAppointmentStatus = asyncHandler(async (req, res) => {
   
   else if (status === 'cancelled') {
     if (appointment.clientPhone) {
-        sendBookingCancellation({ 
+        const notifySpan = tx.startChild({ op: 'notify', description: 'sendBookingCancellation' });
+        await sendBookingCancellation({
           businessId: appointment.businessId?._id || appointment.businessId,
           customerPhone: appointment.clientPhone,
           customerName: appointment.clientName,
-          serviceName: appointment.serviceId?.name || "Service",
+          serviceName: appointment.serviceId?.name || 'Service',
           bookingDate: appointment.formattedDate,
           bookingTime: appointment.startTime,
-          businessName: appointment.businessId?.name || "Notre Établissement"
+          businessName: appointment.businessId?.name || 'Notre Établissement',
         });
+        notifySpan.finish();
     }
+  }
+    tx.finish();
+  } catch (err) {
+    tx.finish();
+    throw err;
   }
 
   res.status(200).json({

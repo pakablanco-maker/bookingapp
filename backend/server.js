@@ -1,12 +1,18 @@
+
+// import './instrument.js'; // Import Sentry instrumentation before any other imports
 import dotenv from 'dotenv';
 dotenv.config();
 import express from 'express';
 import morgan from 'morgan';
 import cors from 'cors';
-import { createServer } from 'http'; // 1. Importer createServer
-import { Server } from 'socket.io';   // 2. Importer Server
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
+import * as Sentry from '@sentry/node';
 import connectDB from './config/db.js';
 import { getSessionStatus } from './config/whtasappManager.js';
+import { captureWarning, captureException, captureInfo } from './config/sentry.js';
 
 // Import routes
 import authRoutes from './routes/authRoutes.js';
@@ -16,25 +22,45 @@ import whatsappRoute from './routes/whatsappRoute.js';
 
 // --- INITIALISATION ---
 const app = express();
-const httpServer = createServer(app); // 3. Créer le serveur HTTP avec Express
+const httpServer = createServer(app);
 
 // 4. Configurer Socket.io
 const io = new Server(httpServer, {
   cors: {
-    origin: "http://localhost:3000", // En dev tu peux mettre "*", en prod mets l'URL de ton frontend
+    origin: process.env.FRONTEND_URL || "http://localhost:3000",
     methods: ["GET", "POST"],
-    credential: true
+    credentials: true
   }
 });
 
 // Connect to MongoDB
 connectDB();
 
+// Security Middleware
+app.use(helmet()); // Set security HTTP headers
+
+// Rate Limiting
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: 'Trop de requêtes depuis cette adresse IP, veuillez réessayer plus tard.',
+  standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+});
+
+// Apply general limiter to all routes
+app.use(generalLimiter);
+
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || "http://localhost:3000",
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(morgan('dev'));
+app.use(morgan('combined')); // Use 'combined' in production for more details
 
 // --- GESTION DES SOCKETS ---
 io.on('connection', (socket) => {
@@ -64,15 +90,76 @@ app.use('/api/auth', authRoutes);
 app.use('/api/services', serviceRoutes);
 app.use('/api/appointments', appointmentRoutes);
 app.use('/api/whatsapp', whatsappRoute);
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({ message: 'Server is running', status: 'OK' });
+
+// Enhanced Health Check with monitoring metrics
+app.get('/api/health', async (req, res) => {
+  try {
+    const health = {
+      timestamp: new Date().toISOString(),
+      status: 'OK',
+      uptime: process.uptime(),
+      environment: process.env.NODE_ENV || 'development',
+      services: {
+        mongodb: 'checking',
+        whatsapp: 'checking',
+      },
+    };
+
+    // Check MongoDB
+    try {
+      const mongoStatus = require('mongoose').connection.readyState;
+      health.services.mongodb = mongoStatus === 1 ? 'connected' : 'disconnected';
+    } catch (err) {
+      health.services.mongodb = 'error';
+    }
+
+    // Check WhatsApp sessions
+    try {
+      health.services.whatsapp = {
+        activeSessions: 0,
+        // Vous pouvez ajouter des stats WhatsApp ici
+      };
+    } catch (err) {
+      health.services.whatsapp = 'error';
+    }
+
+    const allServicesOk = Object.values(health.services).every(
+      s => typeof s === 'string' ? s !== 'error' : true
+    );
+
+    res.status(allServicesOk ? 200 : 503).json(health);
+  } catch (error) {
+    captureWarning('Health check error', { error: error.message });
+    res.status(503).json({
+      status: 'ERROR',
+      message: error.message,
+      timestamp: new Date().toISOString(),
+    });
+  }
 });
 
-// Error handling middleware
+// Test endpoint for Sentry - Send a test error to verify monitoring works
+app.get('/debug-sentry', function mainHandler(req, res) {
+  // Send a log before throwing the error
+  Sentry.logger.info('User triggered test error', {
+    action: 'test_error_endpoint',
+  });
+  // Send a test metric before throwing the error
+  Sentry.metrics.count('test_counter', 1);
+  throw new Error('My first Sentry error!');
+});
+
+// Sentry Error Handler - MUST be after all controllers and routes
+Sentry.setupExpressErrorHandler(app);
+
+// Optional fallthrough error handler
 app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ message: 'Something went wrong!', error: err.message });
+  console.error(err);
+
+  res.status(500).json({
+    success: false,
+    message: "Erreur interne du serveur"
+  });
 });
 
 // --- DÉMARRAGE ---

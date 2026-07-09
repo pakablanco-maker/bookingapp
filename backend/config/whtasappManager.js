@@ -1,18 +1,89 @@
 import pkg from 'whatsapp-web.js';
 const { Client, LocalAuth } = pkg;
-import { io } from '../server.js'; // On importe l'instance socket
-import winston from 'winston'; // Logger pour des logs détaillés
-import puppeteer from 'puppeteer';
 import fs from 'fs';
 import path from 'path';
 import mongoose from 'mongoose';
+import { io } from '../server.js';
+import winston from 'winston';
+import puppeteer from 'puppeteer';
 import Appointment from '../models/Appointment.js';
 import AppointmentMessage from '../models/AppointmentMessage.js';
+import OwnerAlertQueue from '../models/OwnerAlertQueue.js';
+import * as Sentry from '@sentry/node';
+import { captureException, captureWarning, captureInfo } from './sentry.js';
 
 const sessions = new Map(); // Stockage des instances actives
 const sessionStatuses = new Map(); // businessId -> { status: 'idle'|'loading'|'qr'|'ready'|'failed', qr: string|null }
 const messageQueues = new Map(); // businessId -> Array of { customerPhone, message }
-const ownerAlertQueues = new Map(); // businessId -> Array of { appointmentId, shortCode, clientName, clientPhone, serviceName, bookingDate, bookingTime }
+
+const queueOwnerAlert = async (businessId, alertData) => {
+    try {
+        const queued = await OwnerAlertQueue.findOneAndUpdate(
+            {
+                businessId: new mongoose.Types.ObjectId(businessId),
+                appointmentId: new mongoose.Types.ObjectId(alertData.appointmentId),
+            },
+            {
+                businessId: new mongoose.Types.ObjectId(businessId),
+                appointmentId: new mongoose.Types.ObjectId(alertData.appointmentId),
+                shortCode: alertData.shortCode,
+                clientName: alertData.clientName,
+                clientPhone: alertData.clientPhone,
+                serviceName: alertData.serviceName,
+                bookingDate: alertData.bookingDate,
+                bookingTime: alertData.bookingTime,
+                status: 'pending',
+            },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+        logger.info(`Alerte propriétaire persistée en file pour ${businessId} (RDV: ${alertData.shortCode})`);
+        return queued;
+    } catch (err) {
+        if (err.code === 11000) {
+            logger.warn(`Alerte propriétaire déjà en file pour ${businessId} (RDV: ${alertData.shortCode})`);
+            return OwnerAlertQueue.findOne({
+                businessId: new mongoose.Types.ObjectId(businessId),
+                appointmentId: new mongoose.Types.ObjectId(alertData.appointmentId),
+            });
+        }
+        logger.error(`Erreur persistance file d'alerte pour ${businessId}: ${err.message}`);
+        throw err;
+    }
+};
+
+const removeOwnerAlertRecord = async (queueRecord) => {
+    if (!queueRecord || !queueRecord._id) return;
+    try {
+        await OwnerAlertQueue.findByIdAndDelete(queueRecord._id);
+        logger.info(`Alerte propriétaire supprimée de la file DB pour ${queueRecord.businessId} (RDV: ${queueRecord.shortCode})`);
+    } catch (err) {
+        logger.warn(`Impossible de supprimer la file d'alerte DB ${queueRecord._id}: ${err.message}`);
+    }
+};
+
+const getPendingOwnerAlerts = async (businessId) => {
+    return OwnerAlertQueue.find({
+        businessId: new mongoose.Types.ObjectId(businessId),
+        status: 'pending',
+    }).sort({ createdAt: 1 });
+};
+
+const processPendingOwnerAlerts = async (businessId) => {
+    try {
+        const pendingAlerts = await getPendingOwnerAlerts(businessId);
+        if (!pendingAlerts || pendingAlerts.length === 0) return;
+
+        for (const queuedAlert of pendingAlerts) {
+            try {
+                await sendOwnerAlertWithRestore(businessId, queuedAlert);
+            } catch (err) {
+                logger.error(`Erreur envoi alerte propriétaire persistante pour ${businessId} (${queuedAlert.shortCode}): ${err.message}`);
+            }
+        }
+    } catch (err) {
+        logger.error(`Erreur traitement file d'alertes persistante pour ${businessId}: ${err.message}`);
+    }
+};
 
 // Configuration du logger
 const logger = winston.createLogger({
@@ -86,18 +157,8 @@ export const initializeWhatsApp = (businessId) => {
             messageQueues.set(businessId, []);
         }
 
-        // Envoyer les alertes propriétaire en file d'attente
-        if (ownerAlertQueues.has(businessId) && ownerAlertQueues.get(businessId).length > 0) {
-            const queuedAlerts = ownerAlertQueues.get(businessId);
-            for (const alertData of queuedAlerts) {
-                try {
-                    await sendOwnerAlertWithRestore(businessId, alertData);
-                } catch (err) {
-                    logger.error(`Erreur envoi alerte propriétaire depuis la file pour ${businessId}: ${err.message}`);
-                }
-            }
-            ownerAlertQueues.set(businessId, []);
-        }
+        // Envoyer les alertes propriétaire persistantes en file d'attente
+        await processPendingOwnerAlerts(businessId);
     });
 
     // Initialise le client avec retries pour gérer les cas où
@@ -113,10 +174,20 @@ export const initializeWhatsApp = (businessId) => {
         logger.error(`Échec d'authentification pour ${businessId}: ${error}`);
         sessionStatuses.set(businessId, { status: 'failed', qr: null });
         io.to(businessId).emit('whatsapp-status', { status: 'failed' });
+        // 🚨 Alert Sentry on auth failure
+        captureWarning(`WhatsApp Auth Failed: ${businessId}`, {
+            businessId,
+            error: error?.message || error,
+        });
     });
 
     client.on('disconnected', async (reason) => {
         logger.warn(`Client déconnecté pour ${businessId}: ${reason}`);
+        // 🚨 Alert Sentry on disconnect
+        captureWarning(`WhatsApp Disconnected: ${businessId}`, {
+            businessId,
+            reason,
+        });
 
         // Retirer la session immédiatement pour éviter la réutilisation
         sessions.delete(businessId);
@@ -136,6 +207,7 @@ export const initializeWhatsApp = (businessId) => {
                 logger.warn(`Erreur ignorée lors de la destruction (${businessId}): ${destroyErr.message}`);
             } else {
                 logger.error(`Erreur lors de la destruction (${businessId}): ${destroyErr.message}`);
+                captureException(destroyErr, { businessId, context: 'client_destroy' });
             }
         }
     });
@@ -398,6 +470,7 @@ ${'─'.repeat(25)}`;
             await client.sendMessage(msg.from, '⚠️ Commande non reconnue. Envoyez *help* pour la liste des commandes.');
         } catch (err) {
             logger.error(`[Parser WhatsApp] Erreur pour ${businessId}: ${err.message}`);
+            captureException(err, { businessId, context: 'message_parser' });
         }
     };
 
@@ -408,6 +481,7 @@ ${'─'.repeat(25)}`;
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
                 await client.initialize();
+                captureInfo(`WhatsApp initialized successfully: ${businessId}`, { businessId });
                 break; // succès
             } catch (err) {
                 logger.error(`Erreur initialisation (tentative ${attempt}) pour ${businessId}: ${err.message}`);
@@ -429,6 +503,11 @@ ${'─'.repeat(25)}`;
                 sessions.delete(businessId);
                 sessionStatuses.set(businessId, { status: 'failed', qr: null });
                 io.to(businessId).emit('whatsapp-status', { status: 'failed', reason: err.message });
+                captureException(err, {
+                    businessId,
+                    context: 'whatsapp_init',
+                    attempts: attempt,
+                });
                 try {
                     await client.destroy();
                 } catch (e) {
@@ -556,6 +635,10 @@ export const sendMessageWithRestore = async (businessId, customerPhone, message)
 
     if (!client) {
         logger.warn(`Aucune session active ou sauvegardée pour le business ${businessId}. Impossible d'envoyer.`);
+        captureWarning(`No WhatsApp session to send message: ${businessId}`, {
+            businessId,
+            customerPhone,
+        });
         return false;
     }
 
@@ -569,6 +652,11 @@ export const sendMessageWithRestore = async (businessId, customerPhone, message)
             return true;
         } catch (err) {
             logger.error(`Erreur envoi direct pour ${businessId}: ${err}`);
+            captureException(err, {
+                businessId,
+                context: 'send_message',
+                customerPhone,
+            });
             return false;
         }
     } else {
@@ -591,16 +679,21 @@ export const sendOwnerAlertWithRestore = async (businessId, alertData) => {
     }
 
     if (!client) {
-        logger.warn(`Aucune session active ou sauvegardée pour le business ${businessId}. Impossible d'envoyer l'alerte.`);
-        return false;
+        logger.warn(`Aucune session active ou sauvegardée pour le business ${businessId}. Mise en file persistante.`);
+        await queueOwnerAlert(businessId, alertData);
+        return true;
     }
 
     const status = sessionStatuses.get(businessId)?.status;
     if (status === 'ready') {
+        const tx = Sentry.startTransaction({ op: 'notify.owner', name: `Send Owner Alert ${alertData.shortCode}` });
         try {
-            const AppointmentMessage = (await import('../models/AppointmentMessage.js')).default;
-            const ownerJid = client.info.wid._serialized;
-            
+            Sentry.getCurrentHub().configureScope((scope) => scope.setSpan(tx));
+            const ownerJid = client?.info?.wid?._serialized || client?.info?.me?._serialized;
+            if (!ownerJid) {
+                throw new Error('Impossible de récupérer le JID du propriétaire.');
+            }
+
             const message =
 `━━━━━━━━━━━━━━━━━━
 📥 *Nouvelle demande de RDV*
@@ -622,6 +715,10 @@ _(Ou répondez directement à CE message)_
 
             const sentMessage = await client.sendMessage(ownerJid, message);
             logger.info(`Alerte propriétaire envoyée directement pour RDV ${alertData.shortCode}`);
+            captureInfo(`Owner alert sent: ${businessId} - ${alertData.shortCode}`, {
+                businessId,
+                shortCode: alertData.shortCode,
+            });
             
             if (sentMessage && sentMessage.id) {
                 await AppointmentMessage.create({
@@ -632,18 +729,26 @@ _(Ou répondez directement à CE message)_
                 });
                 logger.info(`Lien message créé en base pour RDV ${alertData.shortCode}`);
             }
+
+            if (alertData._id) {
+                await removeOwnerAlertRecord(alertData);
+            }
+
+            tx.finish();
             return true;
         } catch (err) {
-            logger.error(`Erreur envoi alerte propriétaire direct pour ${businessId}: ${err}`);
-            return false;
+            tx.finish();
+            logger.error(`Erreur envoi alerte propriétaire direct pour ${businessId}: ${err.message || err}`);
+            captureException(err, {
+                businessId,
+                context: 'send_owner_alert',
+                shortCode: alertData.shortCode,
+            });
+            await queueOwnerAlert(businessId, alertData);
+            return true;
         }
     } else {
-        // Mettre en file d'attente
-        if (!ownerAlertQueues.has(businessId)) {
-            ownerAlertQueues.set(businessId, []);
-        }
-        ownerAlertQueues.get(businessId).push(alertData);
-        logger.info(`Alerte propriétaire mise en file d'attente pour ${businessId} (RDV: ${alertData.shortCode})`);
+        await queueOwnerAlert(businessId, alertData);
         return true;
     }
 };
