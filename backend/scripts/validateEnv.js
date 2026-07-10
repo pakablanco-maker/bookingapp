@@ -6,10 +6,10 @@ import path from 'path';
 dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 
 const required = [
-  'MONGO_URI',
   'SENTRY_DSN',
   'JWT_SECRET',
   'FRONTEND_URL',
+  'MONGODB_URI',
 ];
 
 const optional = ['PORT', 'NODE_ENV'];

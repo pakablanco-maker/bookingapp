@@ -8,7 +8,13 @@ import * as Sentry from '@sentry/node';
 /**
  * Capturer une exception manuellement
  */
+const isSentryEnabled = () => Boolean(process.env.SENTRY_DSN && Sentry.getClient());
+
 export const captureException = (error, context = {}) => {
+    if (!isSentryEnabled()) {
+        console.warn('[Sentry] Exception not sent because Sentry is not initialized.');
+        return;
+    }
     Sentry.captureException(error, { extra: context });
 };
 
@@ -16,6 +22,10 @@ export const captureException = (error, context = {}) => {
  * Capturer un message de warning
  */
 export const captureWarning = (message, context = {}) => {
+    if (!isSentryEnabled()) {
+        console.warn('[Sentry] Warning not sent because Sentry is not initialized.');
+        return;
+    }
     Sentry.captureMessage(message, 'warning', { extra: context });
 };
 
@@ -23,6 +33,10 @@ export const captureWarning = (message, context = {}) => {
  * Capturer un message d'info
  */
 export const captureInfo = (message, context = {}) => {
+    if (!isSentryEnabled()) {
+        console.warn('[Sentry] Info not sent because Sentry is not initialized.');
+        return;
+    }
     Sentry.captureMessage(message, 'info', { extra: context });
 };
 

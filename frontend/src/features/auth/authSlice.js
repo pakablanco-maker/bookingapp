@@ -184,6 +184,8 @@ const authSlice = createSlice({
       .addCase(updateProfile.fulfilled, (state, action) => {
         state.loading = false;
         state.user = action.payload;
+        state.isAuthenticated = true;
+        state.error = null;
       })
       .addCase(updateProfile.rejected, (state, action) => {
         state.loading = false;
@@ -197,6 +199,8 @@ const authSlice = createSlice({
       .addCase(updateWorkingHours.fulfilled, (state, action) => {
         state.loading = false;
         state.user = action.payload;
+        state.isAuthenticated = true;
+        state.error = null;
       })
       .addCase(updateWorkingHours.rejected, (state, action) => {
         state.loading = false;

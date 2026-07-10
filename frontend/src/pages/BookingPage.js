@@ -6,6 +6,8 @@ import axios from 'axios';
 import { createAppointment, getAvailableSlots } from '../features/appointements/appointmentSlice';
 import { addDays, format, isToday, isBefore, startOfDay } from 'date-fns';
 
+const apiBaseUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
+
 const BookingPage = () => {
   const { slug } = useParams();
   const dispatch = useDispatch();
@@ -39,7 +41,7 @@ const BookingPage = () => {
   const fetchBusinessData = async () => {
     try {
       setLoading(true);
-      const response = await axios.get(`http://localhost:5000/api/auth/public/${slug}`);
+      const response = await axios.get(`${apiBaseUrl}/auth/public/${slug}`);
       setBusiness(response.data.business);
       setServices(response.data.services);
       setError('');
@@ -74,8 +76,8 @@ const BookingPage = () => {
       setSlotsLoading(true);
       const dateStr = format(date, 'yyyy-MM-dd');
       // Fetch available slots directly from API (public route)
-      const response = await axios.get(
-        `http://localhost:5000/api/appointments/available-slots/${business._id}/${selectedService._id}/${dateStr}`
+      await axios.get(
+        `${apiBaseUrl}/appointments/available-slots/${business._id}/${selectedService._id}/${dateStr}`
       );
       // Dispatch to Redux or just manage locally
       dispatch(getAvailableSlots({ 

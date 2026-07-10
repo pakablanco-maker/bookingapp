@@ -668,7 +668,7 @@ export const sendMessageWithRestore = async (businessId, customerPhone, message)
 
 export const sendOwnerAlertWithRestore = async (businessId, alertData) => {
     let client = sessions.get(businessId);
-    
+
     // Si pas de session active mais dossier existant sur disque → restauration automatique
     if (!client) {
         const sessionPath = path.join(process.cwd(), '.wwebjs_auth', `session-${businessId}`);
@@ -686,64 +686,76 @@ export const sendOwnerAlertWithRestore = async (businessId, alertData) => {
 
     const status = sessionStatuses.get(businessId)?.status;
     if (status === 'ready') {
-        const tx = Sentry.startTransaction({ op: 'notify.owner', name: `Send Owner Alert ${alertData.shortCode}` });
         try {
-            Sentry.getCurrentHub().configureScope((scope) => scope.setSpan(tx));
-            const ownerJid = client?.info?.wid?._serialized || client?.info?.me?._serialized;
-            if (!ownerJid) {
-                throw new Error('Impossible de récupérer le JID du propriétaire.');
-            }
+            return await Sentry.startSpan(
+                {
+                    name: `Send Owner Alert ${alertData.shortCode}`,
+                    op: 'notify.owner',
+                },
+                async () => {
+                    const ownerJid =
+                        client?.info?.wid?._serialized ||
+                        client?.info?.me?._serialized;
 
-            const message =
-`━━━━━━━━━━━━━━━━━━
-📥 *Nouvelle demande de RDV*
+                    if (!ownerJid) {
+                        throw new Error('Impossible de récupérer le JID du propriétaire.');
+                    }
 
-🆔 Code : *${alertData.shortCode}*
+                    const message =
+                    `📥 *Nouvelle demande de RDV*
 
-👤 Client : *${alertData.clientName}*
-📞 Tél : ${alertData.clientPhone}
-💇 Service : *${alertData.serviceName}*
-📅 ${alertData.bookingDate}
-🕑 ${alertData.bookingTime}
+                    🆔 Code : *${alertData.shortCode}*
 
-Répondez :
-✅ *1*  —  ou  —  *+${alertData.shortCode}*  → Confirmer
-❌ *0*  —  ou  —  *-${alertData.shortCode}*  → Annuler
+                    👤 Client : *${alertData.clientName}*
+                    📞 Tél : ${alertData.clientPhone}
+                    💇 Service : *${alertData.serviceName}*
+                    📅 ${alertData.bookingDate}
+                    🕑 ${alertData.bookingTime}
 
-_(Ou répondez directement à CE message)_
-━━━━━━━━━━━━━━━━━━`;
+                    Répondez :
+                    ✅ *1*  —  ou  —  *+${alertData.shortCode}*  → Confirmer
+                    ❌ *0*  —  ou  —  *-${alertData.shortCode}*  → Annuler
 
-            const sentMessage = await client.sendMessage(ownerJid, message);
-            logger.info(`Alerte propriétaire envoyée directement pour RDV ${alertData.shortCode}`);
-            captureInfo(`Owner alert sent: ${businessId} - ${alertData.shortCode}`, {
-                businessId,
-                shortCode: alertData.shortCode,
-            });
-            
-            if (sentMessage && sentMessage.id) {
-                await AppointmentMessage.create({
-                    businessId: new mongoose.Types.ObjectId(businessId),
-                    appointmentId: alertData.appointmentId,
-                    messageId: sentMessage.id._serialized,
-                    shortCode: alertData.shortCode,
-                });
-                logger.info(`Lien message créé en base pour RDV ${alertData.shortCode}`);
-            }
+                    _(Ou répondez directement à CE message)`;
 
-            if (alertData._id) {
-                await removeOwnerAlertRecord(alertData);
-            }
+                    const sentMessage = await client.sendMessage(ownerJid, message);
+                    logger.info(`Alerte propriétaire envoyée directement pour RDV ${alertData.shortCode}`);
 
-            tx.finish();
-            return true;
+                    captureInfo(
+                        `Owner alert sent: ${businessId} - ${alertData.shortCode}`,
+                        {
+                            businessId,
+                            shortCode: alertData.shortCode,
+                        }
+                    );
+
+                    if (sentMessage?.id) {
+                        await AppointmentMessage.create({
+                            businessId: new mongoose.Types.ObjectId(businessId),
+                            appointmentId: alertData.appointmentId,
+                            messageId: sentMessage.id._serialized,
+                            shortCode: alertData.shortCode,
+                        });
+                    }
+
+                    if (alertData._id) {
+                        await removeOwnerAlertRecord(alertData);
+                    }
+
+                    return true;
+                }
+            );
         } catch (err) {
-            tx.finish();
-            logger.error(`Erreur envoi alerte propriétaire direct pour ${businessId}: ${err.message || err}`);
+            logger.error(
+                `Erreur envoi alerte propriétaire direct pour ${businessId}: ${err.message}`
+            );
+
             captureException(err, {
                 businessId,
                 context: 'send_owner_alert',
                 shortCode: alertData.shortCode,
             });
+
             await queueOwnerAlert(businessId, alertData);
             return true;
         }
