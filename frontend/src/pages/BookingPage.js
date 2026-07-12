@@ -6,14 +6,15 @@ import axios from 'axios';
 import { createAppointment, getAvailableSlots } from '../features/appointements/appointmentSlice';
 import { addDays, format, isToday, isBefore, startOfDay } from 'date-fns';
 
-const apiBaseUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
+const apiBaseUrl = 'http://localhost:5000/api';
 
 const BookingPage = () => {
   const { slug } = useParams();
   const dispatch = useDispatch();
-  const { availableSlots, loading: appointmentLoading, error: appointmentError } = useSelector(
+  const { availableSlots } = useSelector(
     (state) => state.appointments
   );
+  
 
   const [business, setBusiness] = useState(null);
   const [services, setServices] = useState([]);
@@ -34,10 +35,6 @@ const BookingPage = () => {
 
   const availableDates = Array.from({ length: 30 }, (_, i) => addDays(startOfDay(new Date()), i));
 
-  useEffect(() => {
-    fetchBusinessData();
-  }, [slug]);
-
   const fetchBusinessData = async () => {
     try {
       setLoading(true);
@@ -52,6 +49,11 @@ const BookingPage = () => {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    fetchBusinessData();
+  }, [slug]);
+
 
   const handleServiceSelect = (service) => {
     setSelectedService(service);

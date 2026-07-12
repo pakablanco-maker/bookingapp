@@ -9,8 +9,7 @@ import {
 import { asyncHandler } from '../utils/errorHandler.js';
 import { sendBookingConfirmation, sendBookingCancellation, sendOwnerPendingAlert } from '../utils/whatsappService.js';
 import { generateShortCode } from '../utils/shortCodeGenerator.js';
-import * as Sentry from '@sentry/node';
-import { captureException } from '../config/sentry.js';
+import { captureException, startActiveSpan, addBreadcrumb } from '../config/sentry.js';
 
 // @route   GET /api/appointments
 // @desc    Get all appointments for authenticated business owner
@@ -188,7 +187,6 @@ const createAppointment = asyncHandler(async (req, res) => {
     startTime,
   } = req.body;
 
-  // Validation
   if (
     !businessId ||
     !serviceId ||
@@ -199,158 +197,116 @@ const createAppointment = asyncHandler(async (req, res) => {
   ) {
     return res.status(400).json({
       success: false,
-      message: "Please provide all required fields",
+      message: 'Please provide all required fields',
     });
   }
 
-
-  const appointment = await Sentry.startSpan(
+  // Use modern Sentry tracing pattern
+  return await startActiveSpan(
     {
-      name: "Create Appointment",
-      op: "booking.create",
+      name: 'Create Appointment',
+      op: 'booking.create',
+      description: `Booking appointment for ${clientName}`,
     },
-    async () => {
+    async (span) => {
+      try {
+        // Find service
+        const service = await Service.findById(serviceId);
 
-      // Get service
-      const service = await Sentry.startSpan(
-        {
-          name: "Find Service",
-          op: "db.service.find",
-        },
-        async () => {
-          return await Service.findById(serviceId);
+        if (!service) {
+          const error = new Error('Service not found');
+          error.statusCode = 404;
+          throw error;
         }
-      );
 
+        const endTime = addMinutesToTime(startTime, service.duration);
 
-      if (!service) {
-        const error = new Error("Service not found");
-        error.statusCode = 404;
-        throw error;
-      }
-
-
-      const endTime = addMinutesToTime(
-        startTime,
-        service.duration
-      );
-
-
-      // Check availability
-      const isBooked = await Sentry.startSpan(
-        {
-          name: "Check Appointment Availability",
-          op: "booking.check_availability",
-        },
-        async () => {
-          return await isTimeSlotBooked(
-            Appointment,
-            businessId,
-            serviceId,
-            appointmentDate,
-            startTime,
-            endTime
-          );
-        }
-      );
-
-
-      if (isBooked) {
-        const error = new Error(
-          "This time slot is already booked"
+        // Check availability
+        const isBooked = await isTimeSlotBooked(
+          Appointment,
+          businessId,
+          serviceId,
+          appointmentDate,
+          startTime,
+          endTime
         );
-        error.statusCode = 400;
-        throw error;
-      }
 
-
-      const shortCode = await generateShortCode();
-
-
-      // Create appointment
-      const newAppointment = await Sentry.startSpan(
-        {
-          name: "Save Appointment",
-          op: "db.appointment.create",
-        },
-        async () => {
-
-          return await Appointment.create({
-            businessId,
-            serviceId,
-            clientName,
-            clientPhone,
-            clientEmail,
-            appointmentDate: new Date(appointmentDate),
-            startTime,
-            endTime,
-            status: "pending",
-            shortCode,
-          });
-
+        if (isBooked) {
+          const error = new Error('This time slot is already booked');
+          error.statusCode = 400;
+          throw error;
         }
-      );
 
+        const shortCode = await generateShortCode();
 
-      // WhatsApp notification non bloquante
-      setImmediate(async () => {
+        // Save appointment
+        const newAppointment = await Appointment.create({
+          businessId,
+          serviceId,
+          clientName,
+          clientPhone,
+          clientEmail,
+          appointmentDate: new Date(appointmentDate),
+          startTime,
+          endTime,
+          status: 'pending',
+          shortCode,
+        });
 
-        await Sentry.startSpan(
-          {
-            name: "Send Owner WhatsApp Alert",
-            op: "whatsapp.owner_alert",
-          },
-          async () => {
+        // Add span data for monitoring
+        if (span) {
+          span.setAttribute('appointment.id', newAppointment._id.toString());
+          span.setAttribute('appointment.status', 'pending');
+          span.setAttribute('service.duration', service.duration);
+        }
 
-            try {
+        // Send owner alert asynchronously (don't block response)
+        setImmediate(async () => {
+          try {
+            const formattedDate = formatDate(new Date(appointmentDate));
 
-              const formattedDate = formatDate(
-                new Date(appointmentDate)
-              );
-
-
-              await sendOwnerPendingAlert(
-                businessId.toString(),
-                {
-                  appointmentId: newAppointment._id,
-                  shortCode,
-                  clientName,
-                  clientPhone,
-                  serviceName: service.name,
-                  bookingDate: formattedDate,
-                  bookingTime: startTime,
-                }
-              );
-
-
-            } catch (err) {
-
-              captureException(err, {
-                businessId,
-                appointmentId: newAppointment._id,
-                module: "whatsapp",
-              });
-
-            }
-
+            await sendOwnerPendingAlert(businessId.toString(), {
+              appointmentId: newAppointment._id,
+              shortCode,
+              clientName,
+              clientPhone,
+              serviceName: service.name,
+              bookingDate: formattedDate,
+              bookingTime: startTime,
+            });
+          } catch (err) {
+            captureException(err, {
+              businessId,
+              appointmentId: newAppointment._id,
+              module: 'whatsapp.owner_alert',
+            });
           }
-        );
+        });
 
-      });
+        // Log success
+        addBreadcrumb({
+          category: 'booking.create',
+          message: `Appointment created: ${shortCode}`,
+          level: 'info',
+          data: { appointmentId: newAppointment._id.toString() },
+        });
 
-
-      return newAppointment;
-
+        res.status(201).json({
+          success: true,
+          message: 'Appointment booked successfully',
+          data: newAppointment,
+        });
+      } catch (err) {
+        // Error will be automatically captured by Sentry's error handler
+        captureException(err, {
+          businessId,
+          serviceId,
+          module: 'appointment.create',
+        });
+        throw err;
+      }
     }
   );
-
-
-  res.status(201).json({
-    success: true,
-    message: "Appointment booked successfully",
-    data: appointment,
-  });
-
 });
 
 // @route   PUT /api/appointments/:id
@@ -363,76 +319,91 @@ const updateAppointmentStatus = asyncHandler(async (req, res) => {
     return res.status(400).json({ success: false, message: 'Please provide a valid status' });
   }
 
-  // 1. Récupération initiale
+  // 1. Initial fetch
   let appointment = await Appointment.findById(req.params.id);
 
   if (!appointment) {
     return res.status(404).json({ success: false, message: 'Appointment not found' });
   }
 
-  // 2. Mise à jour (avec transaction Sentry)
-  const tx = Sentry.startSpan({ name: `Update Appointment ${req.params.id} -> ${status}`, op: 'booking.update_status' });
-  try {
-    const dbSpan = Sentry.startSpan({ name: 'Appointment.findByIdAndUpdate', op: 'db', parentSpan: tx });
-    appointment = await Appointment.findByIdAndUpdate(
-      req.params.id,
-      { status },
-      { new: true, runValidators: true }
-    ).populate('serviceId', 'name price').populate('businessId', 'name');
-    dbSpan.end();
+  // Use modern Sentry tracing pattern
+  return await startActiveSpan(
+    {
+      name: 'Update Appointment Status',
+      op: 'booking.update_status',
+      description: `Update appointment ${req.params.id} to ${status}`,
+    },
+    async (span) => {
+      try {
+        appointment = await Appointment.findByIdAndUpdate(
+          req.params.id,
+          { status },
+          { new: true, runValidators: true }
+        ).populate('serviceId', 'name price').populate('businessId', 'name');
 
-  // --- DEBUG LOGS (À supprimer après test) ---
-  console.log("Nom Client:", appointment.clientName);
-  console.log("Tel Client:", appointment.clientPhone);
-  // -------------------------------------------
+        // Add span data for monitoring
+        if (span) {
+          span.setAttribute('appointment.id', appointment._id.toString());
+          span.setAttribute('appointment.status', status);
+        }
 
-  // --- LOGIQUE D'ENVOI WHATSAPP ---
-    if (status === 'confirmed') {
-    // On vérifie que le téléphone existe avant d'appeler le service
-    if (appointment.clientPhone) {
-        // send notification as part of the Sentry transaction
-        const notifySpan = Sentry.startSpan({ name: 'sendBookingConfirmation', op: 'notify', parentSpan: tx });
-        await sendBookingConfirmation({
-          businessId: appointment.businessId?._id || appointment.businessId,
-          customerPhone: appointment.clientPhone,
-          customerName: appointment.clientName,
-          serviceName: appointment.serviceId?.name || 'Service',
-          bookingDate: appointment.formattedDate,
-          bookingTime: appointment.startTime,
-          businessName: appointment.businessId?.name || 'Notre Établissement',
+        // Send notifications based on status
+        if (status === 'confirmed') {
+          if (appointment.clientPhone) {
+            await sendBookingConfirmation({
+              businessId: appointment.businessId?._id || appointment.businessId,
+              customerPhone: appointment.clientPhone,
+              customerName: appointment.clientName,
+              serviceName: appointment.serviceId?.name || 'Service',
+              bookingDate: appointment.formattedDate,
+              bookingTime: appointment.startTime,
+              businessName: appointment.businessId?.name || 'Notre Établissement',
+            });
+            addBreadcrumb({
+              category: 'booking.confirmed',
+              message: `Confirmation sent to ${appointment.clientPhone}`,
+              level: 'info',
+              data: { appointmentId: appointment._id.toString() },
+            });
+          } else {
+            console.error("Cannot send WhatsApp: clientPhone is missing.");
+          }
+        } else if (status === 'cancelled') {
+          if (appointment.clientPhone) {
+            await sendBookingCancellation({
+              businessId: appointment.businessId?._id || appointment.businessId,
+              customerPhone: appointment.clientPhone,
+              customerName: appointment.clientName,
+              serviceName: appointment.serviceId?.name || 'Service',
+              bookingDate: appointment.formattedDate,
+              bookingTime: appointment.startTime,
+              businessName: appointment.businessId?.name || 'Notre Établissement',
+            });
+            addBreadcrumb({
+              category: 'booking.cancelled',
+              message: `Cancellation sent to ${appointment.clientPhone}`,
+              level: 'info',
+              data: { appointmentId: appointment._id.toString() },
+            });
+          }
+        }
+
+        res.status(200).json({
+          success: true,
+          message: 'Appointment updated successfully',
+          data: appointment,
         });
-        notifySpan.end();
-    } else {
-        console.error("Impossible d'envoyer le WhatsApp : clientPhone est manquant.");
-    }
-  } 
-  
-  else if (status === 'cancelled') {
-    if (appointment.clientPhone) {
-        const notifySpan = Sentry.startSpan({ name: 'sendBookingCancellation', op: 'notify', parentSpan: tx });
-        await sendBookingCancellation({
-          businessId: appointment.businessId?._id || appointment.businessId,
-          customerPhone: appointment.clientPhone,
-          customerName: appointment.clientName,
-          serviceName: appointment.serviceId?.name || 'Service',
-          bookingDate: appointment.formattedDate,
-          bookingTime: appointment.startTime,
-          businessName: appointment.businessId?.name || 'Notre Établissement',
+      } catch (err) {
+        // Error will be automatically captured by Sentry's error handler
+        captureException(err, {
+          appointmentId: req.params.id,
+          newStatus: status,
+          module: 'appointment.update_status',
         });
-        notifySpan.end();
+        throw err;
+      }
     }
-  }
-    tx.end();
-  } catch (err) {
-    tx.end();
-    throw err;
-  }
-
-  res.status(200).json({
-    success: true,
-    message: 'Appointment updated successfully',
-    data: appointment,
-  });
+  );
 });
 
 // @route   DELETE /api/appointments/:id

@@ -12,7 +12,7 @@ import { Server } from 'socket.io';
 import * as Sentry from '@sentry/node';
 import connectDB from './config/db.js';
 import { getSessionStatus } from './config/whtasappManager.js';
-import { captureWarning, captureException, captureInfo } from './config/sentry.js';
+import { captureWarning, captureException, captureInfo, addBreadcrumb } from './config/sentry.js';
 
 // Import routes
 import authRoutes from './routes/authRoutes.js';
@@ -60,7 +60,7 @@ const corsOptions = {
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
 };
 
-// 4. Configurer Socket.io
+// 4. Configure Socket.io with Sentry instrumentation
 const io = new Server(httpServer, {
   cors: {
     origin: (origin, callback) => {
@@ -76,30 +76,42 @@ const io = new Server(httpServer, {
   }
 });
 
+// Instrument Socket.io with Sentry (modern 2026 integration)
+// This captures Socket.io events and errors within Sentry
+try {
+  if (Sentry.socketioIntegration) {
+    io.use(Sentry.socketioIntegration());
+  }
+} catch (e) {
+  console.log('⚠️  Socket.io Sentry integration not available in this version');
+}
+
 // Connect to MongoDB
 connectDB();
 
-// Security Middleware
-app.use(helmet()); // Set security HTTP headers
+// ========== MIDDLEWARE CHAIN (ORDER MATTERS FOR SENTRY) ==========
 
-// Rate Limiting
+// 1. Security headers
+app.use(helmet());
+
+
+
+// 4. Rate Limiting
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // Limit each IP to 100 requests per windowMs
   message: 'Trop de requêtes depuis cette adresse IP, veuillez réessayer plus tard.',
-  standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  standardHeaders: true,
+  legacyHeaders: false,
 });
-
-// Apply general limiter to all routes
 app.use(generalLimiter);
 
-// Middleware
+// 5. CORS and parsing
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(morgan('combined')); // Use 'combined' in production for more details
+app.use(morgan('combined'));
 
 // --- GESTION DES SOCKETS ---
 io.on('connection', (socket) => {
@@ -166,6 +178,14 @@ app.get('/api/health', async (req, res) => {
       s => typeof s === 'string' ? s !== 'error' : true
     );
 
+    // Log health check
+    addBreadcrumb({
+      category: 'health.check',
+      message: 'Health check performed',
+      level: 'info',
+      data: { status: health.status, services: health.services },
+    });
+
     res.status(allServicesOk ? 200 : 503).json(health);
   } catch (error) {
     captureWarning('Health check error', { error: error.message });
@@ -179,19 +199,30 @@ app.get('/api/health', async (req, res) => {
 
 // Test endpoint for Sentry - Send a test error to verify monitoring works
 app.get('/debug-sentry', function mainHandler(req, res) {
-  // Send a log before throwing the error
-  Sentry.logger.info('User triggered test error', {
+  // Send a test message
+  captureInfo('Test error endpoint triggered', {
     action: 'test_error_endpoint',
+    userId: req.userId || 'unknown',
   });
-  // Send a test metric before throwing the error
-  Sentry.metrics.count('test_counter', 1);
-  throw new Error('My first Sentry error!');
+
+  // Add breadcrumb for context
+  addBreadcrumb({
+    category: 'test.sentry',
+    message: 'Debug Sentry endpoint called',
+    level: 'info',
+    data: { endpoint: '/debug-sentry' },
+  });
+
+  // Throw test error - will be captured by Sentry error handler
+  throw new Error('This is a test error for Sentry monitoring');
 });
 
-// Sentry Error Handler - MUST be after all controllers and routes
+// ========== ERROR HANDLING (MUST BE LAST) ==========
+
+// Sentry error handler (MUST be before any other error handler)
 Sentry.setupExpressErrorHandler(app);
 
-// Optional fallthrough error handler
+// Optional fallthrough error handler for non-Sentry errors
 app.use((err, req, res, next) => {
   console.error(err);
 
